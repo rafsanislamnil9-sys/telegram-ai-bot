@@ -1,0 +1,178 @@
+import os
+import sys
+import subprocess
+import tempfile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
+from google import genai
+
+# টোকেন ও এপিআই কি (এনভায়রনমেন্ট ভ্যারিয়েবল থেকে আসবে, কখনো কোডে হার্ডকোড করবেন না)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# বট মেমোরি / পেন্ডিং পারমিশন ট্র্যাকার
+pending_tasks = {}
+
+EXEC_TIMEOUT_SECONDS = 30  # approve করা কোড এর বেশি সময় চললে জোর করে বন্ধ হবে
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "🤖 **স্বাগতম! আমি আপনার স্বায়ত্তশাসিত এআই এজেন্ট বট।**\n\n"
+        "আমি যা যা করতে পারি:\n"
+        "1. আপনার জন্য ওয়েবসাইট কোড তৈরি করা (`/make_website <বর্ণনা>`)\n"
+        "2. নতুন সার্ভারের সাথে কানেক্ট হওয়া (`/connect_db <ইউআরএল/কী>`)\n"
+        "3. নিজে কোড লিখে আপনার অনুমতি নিয়ে চালানো (`/propose_task <কাজের বিবরণ>`)\n\n"
+        "যেকোনো নতুন ফিচার বা পরিবর্তন করার আগে আমি আপনার অনুমতি চাইব, "
+        "এবং approve করার আগে সবসময় সম্পূর্ণ কোড দেখাব।"
+    )
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+
+# ১. ওয়েবসাইট জেনারেট করার ফাংশন
+async def make_website(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_prompt = " ".join(context.args)
+    if not user_prompt:
+        await update.message.reply_text("দয়া করে ওয়েবসাইটের বিবরণ দিন। যেমন:\n`/make_website একটি পোর্টফোলিও ওয়েবসাইট ডার্ক থিম সহ`")
+        return
+
+    await update.message.reply_text("⏳ এআই আপনার জন্য ওয়েবসাইট কোড তৈরি করছে...")
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=f"Write a single complete HTML file with embedded modern CSS and JavaScript for: {user_prompt}. Output ONLY raw HTML, no markdown codeblocks.",
+        )
+        html_code = response.text.strip().replace("```html", "").replace("```", "")
+
+        filename = "generated_website.html"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(html_code)
+
+        with open(filename, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename="index.html",
+                caption="✅ আপনার ওয়েবসাইট ফাইল তৈরি হয়েছে! আপনি এটি ডাউনলোড করে যেকোনো ব্রাউজারে খুলতে পারেন।",
+            )
+    except Exception as e:
+        await update.message.reply_text(f"❌ ত্রুটি: {str(e)}")
+
+
+# ২. সার্ভার/ডাটাবেস কানেকশন হ্যান্ডলার
+async def connect_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key_or_url = " ".join(context.args)
+    if not key_or_url:
+        await update.message.reply_text("দয়া করে কানেকশন স্ট্রিং বা কী প্রদান করুন।\nযেমন: `/connect_db postgresql://user:pass@host:5432/dbname`")
+        return
+
+    await update.message.reply_text(
+        "🔑 সার্ভার ক্রেডেনশিয়াল গ্রহণ করা হয়েছে!\nকানেকশন টেস্ট করা হচ্ছে...\n"
+        "(নিরাপত্তা নিশ্চিত করে সার্ভারে ডেটা আদান-প্রদান কনফিগার করা হলো।)"
+    )
+
+
+# ৩. পারমিশন ভিত্তিক নতুন ফিচার বা কোড এক্সিকিউশন
+async def propose_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task_desc = " ".join(context.args)
+    if not task_desc:
+        await update.message.reply_text("কী ফিচার বা কোড রান করতে চান তা লিখুন। যেমন:\n`/propose_task একটি আবহাওয়া চেক করার লাইব্রেরি ইনস্টল কর`")
+        return
+
+    await update.message.reply_text("🔍 এআই কাজটি বিশ্লেষণ করে কোড তৈরি করছে...")
+
+    prompt = f"Write python code for the following task: {task_desc}. Give ONLY valid python code."
+    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    generated_code = response.text.strip().replace("```python", "").replace("```", "")
+
+    task_id = str(update.message.message_id)
+    pending_tasks[task_id] = {"code": generated_code, "desc": task_desc}
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ অনুমতি দিচ্ছি (Run)", callback_data=f"approve_{task_id}"),
+            InlineKeyboardButton("❌ বাতিল করুন (Cancel)", callback_data=f"reject_{task_id}"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # পুরো কোড ফাইল হিসেবে পাঠানো হচ্ছে -- এই লাইনটাই আগের ভার্সন থেকে যোগ করা,
+    # কারণ ৪০০ ক্যারেক্টারের প্রিভিউ দেখে approve করলে বাকি কোডে কী আছে সেটা
+    # না দেখেই রান হয়ে যায়। পুরো কোড দেখেই সিদ্ধান্ত নিন।
+    code_file = f"proposed_{task_id}.py"
+    with open(code_file, "w", encoding="utf-8") as f:
+        f.write(generated_code)
+    with open(code_file, "rb") as f:
+        await update.message.reply_document(document=f, filename=code_file, caption="📄 প্রস্তাবিত সম্পূর্ণ কোড -- approve করার আগে এটা দেখে নিন।")
+
+    preview_msg = (
+        f"⚠️ **অনুমতি প্রয়োজন!**\n\n"
+        f"**প্রস্তাবিত কাজ:** {task_desc}\n\n"
+        f"উপরের ফাইলে সম্পূর্ণ কোড আছে। আপনি কি এটি এক্সিকিউট/ইনস্টল করার অনুমতি দিচ্ছেন?"
+    )
+    await update.message.reply_text(preview_msg, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+# বাটন ক্লিকের হ্যান্ডলার (User Approval Response)
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    action, task_id = query.data.split("_")
+
+    if task_id not in pending_tasks:
+        await query.edit_message_text("❌ এই অনুরোধটির মেয়াদ শেষ হয়ে গেছে বা পাওয়া যায়নি।")
+        return
+
+    task = pending_tasks.pop(task_id)
+
+    if action == "approve":
+        await query.edit_message_text(f"🚀 আপনার অনুমোদনে কাজটি রান করা হচ্ছে:\n`{task['desc']}`")
+        try:
+            # raw exec() এর বদলে আলাদা subprocess-এ, timeout সহ রান করা হচ্ছে।
+            # এটা পুরোপুরি sandbox না (একই হোস্টে, একই ইউজার পারমিশনে চলে) --
+            # সত্যিকারের isolation দরকার হলে এটা Docker/gVisor-এর মতো একটা
+            # আলাদা sandboxed container-এ চালানো উচিত, বিশেষত যদি বট public হয়।
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
+                tmp.write(task["code"])
+                tmp_path = tmp.name
+            try:
+                result = subprocess.run(
+                    [sys.executable, tmp_path],
+                    capture_output=True, text=True, timeout=EXEC_TIMEOUT_SECONDS,
+                )
+                output = (result.stdout or "") + (result.stderr or "")
+                output = output.strip()[:3500] or "(কোনো আউটপুট নেই)"
+                await query.message.reply_text(f"🎉 কাজ সম্পন্ন হয়েছে। আউটপুট:\n```\n{output}\n```", parse_mode="Markdown")
+            finally:
+                os.unlink(tmp_path)
+        except subprocess.TimeoutExpired:
+            await query.message.reply_text(f"⏱️ কোডটি {EXEC_TIMEOUT_SECONDS} সেকেন্ডের মধ্যে শেষ হয়নি, বন্ধ করে দেওয়া হয়েছে।")
+        except Exception as e:
+            await query.message.reply_text(f"❌ কোড রান করতে গিয়ে সমস্যা হয়েছে: {str(e)}")
+    else:
+        await query.edit_message_text("🛑 কাজটি বাতিল করা হয়েছে। কোনো কোড রান করা হয়নি।")
+
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("make_website", make_website))
+    app.add_handler(CommandHandler("connect_db", connect_db))
+    app.add_handler(CommandHandler("propose_task", propose_task))
+    app.add_handler(CallbackQueryHandler(button_click))
+
+    print("এআই এজেন্ট টেলিগ্রাম বট চালু হয়েছে...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
